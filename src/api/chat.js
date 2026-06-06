@@ -706,7 +706,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
     logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
+    const errorMessage = response.error || response.statusText || (response.status ? `HTTP ${response.status}` : 'Неизвестная ошибка');
+    logError(`Ошибка при получении ответа: ${errorMessage}`);
+    if (!response.error && !response.statusText && response.errorBody) {
+        logDebug(`Ответ с ошибкой без statusText: ${response.errorBody}`);
+    }
     if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
 
     if (response.html && response.html.includes('Verification')) {
@@ -729,7 +733,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         }
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            logInfo('Пересоздаем чат с новым токеном');
+            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
         logError('Не осталось валидных токенов или исчерпаны попытки.');
         return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
@@ -753,7 +758,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         authToken = null;
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            logInfo('Пересоздаем чат с новым токеном');
+            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
@@ -766,8 +772,14 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
+    const browserContext = getBrowserContext();
+    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
+
+    const tokenObj = await resolveAuthToken(browserContext);
+    if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
+
     if (!chatId) {
-        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType);
+        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
         if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
         chatId = newChatResult.chatId;
         logInfo(`Создан новый чат v2 с ID: ${chatId}`);
@@ -791,12 +803,6 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         const typeLabels = { t2i: 'изображение', t2v: 'видео' };
         logInfo(`Тип генерации: ${chatType} (${typeLabels[chatType] || chatType})${size ? `, размер: ${size}` : ''}`);
     }
-
-    const browserContext = getBrowserContext();
-    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
-
-    const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
 
     let page = null;
     try {
@@ -1005,11 +1011,11 @@ export function getAuthToken() {
 
 // ─── createChatV2 ────────────────────────────────────────────────────────────
 
-export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t') {
+export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t', preselectedToken = null) {
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Браузер не инициализирован' };
 
-    const tokenObj = await getAvailableToken();
+    const tokenObj = preselectedToken || await getAvailableToken();
     if (tokenObj?.token) {
         authToken = tokenObj.token;
         logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);

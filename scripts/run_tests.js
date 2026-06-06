@@ -1,44 +1,67 @@
 import axios from 'axios';
 import fs from 'fs';
 
-const base = 'http://localhost:3264/api/chat/completions';
+import { getMappedModel } from '../src/api/modelMapping.js';
+
+import { DEFAULT_MODEL } from '../src/config.js';
+
+const BASE_URL = 'http://localhost:3264/api/chat/completions';
+const TEST_MODEL = getMappedModel('qwen-max-latest', DEFAULT_MODEL);
 const headers = { 'User-Agent': 'OpenWebUI-Test/1.0', 'Content-Type': 'application/json' };
 
-async function run() {
-  try {
-    console.log('POST 1: Меня зовут Дима');
-    const r1 = await axios.post(base, { model: 'qwen-max-latest', messages: [{ role: 'user', content: 'Меня зовут Дима' }] }, { headers, timeout: 120000 });
-    console.log('Статус ответа 1:', r1.status);
-    console.log(JSON.stringify(r1.data, null, 2));
-    fs.writeFileSync('./tmp_response1.json', JSON.stringify(r1.data, null, 2), 'utf8');
-
-    await new Promise(r => setTimeout(r, 500));
-
-    console.log('\nPOST 2: Как меня зовут?');
-    const r2 = await axios.post(base, { model: 'qwen-max-latest', messages: [{ role: 'user', content: 'Как меня зовут?' }] }, { headers, timeout: 120000 });
-    console.log('Статус ответа 2:', r2.status);
-    console.log(JSON.stringify(r2.data, null, 2));
-    fs.writeFileSync('./tmp_response2.json', JSON.stringify(r2.data, null, 2), 'utf8');
-
-    console.log('\nSaved responses to tmp_response1.json and tmp_response2.json');
-
-    // tail logs that may include rawChunks entries
+async function checkServer() {
     try {
-      const logs = fs.readFileSync('./logs/server.log', 'utf8');
-      const matches = logs.split(/\r?\n/).filter(l => l.includes('[raw]') || l.includes('rawChunks') || l.includes('Ответ получен успешно'));
-      console.log('\n--- recent raw log lines (filtered) ---');
-      console.log(matches.slice(-40).join('\n'));
-    } catch (e) {
-      console.warn('Could not read server log file (server.log). Listing logs folder instead:');
-      console.log(fs.readdirSync('./logs').join('\n'));
+        const r = await axios.get('http://localhost:3264/api/health', { timeout: 5000 });
+        return r.status === 200;
+    } catch {
+        return false;
+    }
+}
+
+function formatError(e) {
+    if (e instanceof AggregateError) {
+        const messages = e.errors.map(err => err.message || err.code || String(err)).join('\n');
+        return `AggregateError (${e.errors.length} ошибок):\n${messages}`;
+    }
+    if (e.code === 'ECONNREFUSED' || e.code === 'ERR_NETWORK') {
+        return 'Не удалось подключиться к серверу на localhost:3264. Запустите start.bat сначала.';
+    }
+    let msg = e.message || String(e);
+    if (e.response?.data) {
+        try {
+            const data = typeof e.response.data === 'string' ? e.response.data : JSON.stringify(e.response.data);
+            msg += `\nОтвет сервера: ${data.slice(0, 500)}`;
+        } catch {}
+    }
+    return msg;
+}
+
+async function run() {
+    if (!await checkServer()) {
+        console.error('Сервер не запущен на localhost:3264. Запустите start.bat сначала.');
+        process.exit(1);
     }
 
-  } catch (e) {
-    console.error('Ошибка при запуске тестов:', e.toString());
-    if (e.response && e.response.data) {
-      console.error('Данные ответа:', JSON.stringify(e.response.data, null, 2));
+    try {
+        console.log(`POST 1: Меня зовут Дима (модель: ${TEST_MODEL})`);
+        const r1 = await axios.post(BASE_URL, { model: TEST_MODEL, messages: [{ role: 'user', content: 'Меня зовут Дима' }] }, { headers, timeout: 120000 });
+        console.log('Статус:', r1.status);
+        console.log(JSON.stringify(r1.data, null, 2));
+        fs.writeFileSync('./tmp_response1.json', JSON.stringify(r1.data, null, 2), 'utf8');
+
+        await new Promise(r => setTimeout(r, 500));
+
+        console.log('\nPOST 2: Как меня зовут?');
+        const r2 = await axios.post(BASE_URL, { model: TEST_MODEL, messages: [{ role: 'user', content: 'Как меня зовут?' }] }, { headers, timeout: 120000 });
+        console.log('Статус:', r2.status);
+        console.log(JSON.stringify(r2.data, null, 2));
+        fs.writeFileSync('./tmp_response2.json', JSON.stringify(r2.data, null, 2), 'utf8');
+
+        console.log('\nСохранено в tmp_response1.json и tmp_response2.json');
+
+    } catch (e) {
+        console.error('Ошибка при запуске тестов:', formatError(e));
     }
-  }
 }
 
 run();

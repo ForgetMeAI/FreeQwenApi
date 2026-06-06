@@ -11,7 +11,6 @@ const CANONICAL_MODELS = Object.freeze([
     "qwen3-coder-plus",
     "qwen3-omni-flash",
     "qwen3-omni-flash-2025-12-01",
-    "qwen-max-latest",
     "qwen-plus-2025-09-11",
     "qwen-plus-2025-01-25",
     "qwq-32b",
@@ -73,7 +72,10 @@ const ALIAS_GROUPS = Object.freeze({
         "Qwen3-Max",
         "Qwen3-Maximum",
         "qwen3-max-preview",
-        "Qwen3-Max-Preview"
+        "Qwen3-Max-Preview",
+        "qwen-max-latest",
+        "Qwen2.5-Max",
+        "qwen2.5-max"
     ],
     "qwen3-vl-plus": [
         "qwen-vl",
@@ -132,14 +134,6 @@ const ALIAS_GROUPS = Object.freeze({
         "Qwen3-Coder-Flash",
         "qwen3-coder-30b",
         "Qwen3-Coder-30B-A3B-Instruct"
-    ],
-    "qwen-max-latest": [
-        "Qwen2.5-Max",
-        "qwen2.5-max"
-    ],
-    "qwen-plus-2025-01-25": [
-        "Qwen2.5-Plus",
-        "qwen2.5-plus"
     ],
     "qwq-32b": [
         "qwq",
@@ -229,26 +223,17 @@ const buildModelMapping = () => {
 
 export const MODEL_MAPPING = buildModelMapping();
 
-/**
- * Получить соответствующую доступную модель
- * @param {string} requestedModel - Запрошенная модель
- * @param {string} defaultModel - Модель по умолчанию
- * @returns {string} - Доступная модель
- */
 export function getMappedModel(requestedModel, defaultModel = DEFAULT_MODEL) {
     if (!requestedModel) return defaultModel;
 
-    // Проверяем точное соответствие в словаре
     if (MODEL_MAPPING[requestedModel]) {
         return MODEL_MAPPING[requestedModel];
     }
 
-    // Проверяем, является ли запрошенная модель уже доступной
     const availableModels = Object.values(MODEL_MAPPING);
     if (availableModels.includes(requestedModel)) {
         return requestedModel;
     }
 
-    // Возвращаем модель по умолчанию, если соответствие не найдено
     return defaultModel;
-} 
+}
