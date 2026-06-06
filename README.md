@@ -20,6 +20,7 @@ http://localhost:3264/api
 ## Возможности fork
 
 - **Chat Completions API**: `POST /api/chat/completions`, совместимый с OpenAI SDK, Open WebUI, LiteLLM и агентами.
+- **Thinking / reasoning для Qwen Chat**: текстовые запросы в этой копии по умолчанию уходят с `thinking_enabled`; ответ разделяет размышления (`reasoning_content`) и финальный текст (`content`).
 - **Актуальные модели Qwen Chat**: `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus` и другие модели из `src/AvailableModels.txt`.
 - **Генерация изображений через Qwen Chat**: `POST /api/images/generations` без `DASHSCOPE_API_KEY`.
 - **Генерация видео через Qwen Chat**: `POST /api/videos/generations` + polling задач через `GET /api/tasks/status/:taskId`.
@@ -122,12 +123,31 @@ curl http://localhost:3264/api/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen3.7-max",
+    "enable_thinking": true,
     "messages": [
       {"role": "user", "content": "Ответь коротко: что такое FreeQwenApi?"}
     ],
     "stream": false
   }'
 ```
+
+В non-streaming ответе размышления возвращаются отдельно:
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "reasoning_content": "...ход рассуждения...",
+        "content": "...финальный ответ..."
+      }
+    }
+  ]
+}
+```
+
+В streaming-режиме reasoning приходит чанками как `delta.reasoning_content`, а финальный ответ как `delta.content`. Отключить thinking для конкретного запроса можно через `enable_thinking: false`, `thinking_enabled: false` или `reasoning_effort: "none"`.
 
 OpenAI SDK:
 

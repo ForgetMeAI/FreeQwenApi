@@ -4,7 +4,7 @@
 import OpenAI from 'openai';
 
 const openai = new OpenAI({
-    baseURL: 'http://localhost:3264/api', 
+    baseURL: 'http://localhost:3264/api',
     apiKey: 'dummy-key', // Ключ не используется, но требуется для SDK
 });
 
@@ -14,16 +14,16 @@ async function systemMessageExample() {
 
         const completion = await openai.chat.completions.create({
             messages: [
-                { 
-                    role: 'system', 
-                    content: 'Ты опытный астроном, который специализируется на планетах Солнечной системы. Отвечай научно точно, но понятным языком.' 
+                {
+                    role: 'system',
+                    content: 'Ты опытный астроном, который специализируется на планетах Солнечной системы. Отвечай научно точно, но понятным языком.'
                 },
-                { 
-                    role: 'user', 
-                    content: 'Расскажи мне о Марсе и его особенностях' 
+                {
+                    role: 'user',
+                    content: 'Расскажи мне о Марсе и его особенностях'
                 }
             ],
-            model: 'qwen-max-latest', 
+            model: 'qwen-max-latest',
         });
 
         console.log('Ответ от Qwen:\n');
@@ -36,4 +36,4 @@ async function systemMessageExample() {
 }
 
 // Запуск
-systemMessageExample(); 
+systemMessageExample();

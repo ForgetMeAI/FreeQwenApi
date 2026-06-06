@@ -12,8 +12,15 @@ import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
-    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL
+    TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
+    QWEN_THINKING_ENABLED, QWEN_THINKING_BUDGET
 } from '../config.js';
+import {
+    appendQwenStreamChunk,
+    buildAssistantMessage,
+    createQwenAccumulator,
+    resolveThinkingOptions
+} from './qwenReasoning.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -338,16 +345,21 @@ async function resolveAuthToken(browserContext) {
     return authToken ? { id: 'browser', token: authToken } : null;
 }
 
-function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null) {
+export function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null, reasoningOptions = {}) {
     const userMessageId = crypto.randomUUID();
     const assistantChildId = crypto.randomUUID();
 
     const isVideo = chatType === 't2v';
+    const isTextChat = chatType === 't2t';
+    const thinking = resolveThinkingOptions(reasoningOptions, QWEN_THINKING_ENABLED, QWEN_THINKING_BUDGET);
 
     const featureConfig = {
-        thinking_enabled: isVideo,
+        thinking_enabled: isVideo || (isTextChat && thinking.enabled),
         output_schema: 'phase'
     };
+    if (isTextChat && featureConfig.thinking_enabled) {
+        featureConfig.thinking_budget = thinking.budget;
+    }
     if (isVideo) {
         featureConfig.research_mode = 'normal';
         featureConfig.auto_thinking = true;
@@ -468,14 +480,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         const decoder = new TextDecoder();
         let buffer = '';
-        let fullContent = '';
-        let responseId = null;
-        let usage = null;
-        let finished = false;
+        const accumulator = createQwenAccumulator();
         let streamError = null;
-        let hasStreamedChunks = false;
 
-        while (!finished) {
+        while (!accumulator.finished) {
             const { done, value } = await reader.read();
             if (done) break;
 
@@ -485,12 +493,14 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
             for (const rawLine of lines) {
                 const line = rawLine.trim();
-                if (!line || !line.startsWith('data:')) continue;
+                if (!line) continue;
 
-                const jsonStr = line.substring(5).trim();
+                const jsonStr = line.startsWith('data:')
+                    ? line.substring(5).trim()
+                    : line.startsWith('{') ? line : '';
                 if (!jsonStr) continue;
                 if (jsonStr === '[DONE]') {
-                    finished = true;
+                    accumulator.finished = true;
                     break;
                 }
 
@@ -499,32 +509,16 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
                     if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
                         streamError = { status: 429, errorBody: JSON.stringify(chunk) };
-                        finished = true;
+                        accumulator.finished = true;
                         break;
                     }
                     if (chunk.error && !chunk.choices) {
                         streamError = { status: 500, errorBody: JSON.stringify(chunk) };
-                        finished = true;
+                        accumulator.finished = true;
                         break;
                     }
 
-                    if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                    if (chunk.response_id) responseId = chunk.response_id;
-
-                    if (chunk.choices && chunk.choices[0]) {
-                        const delta = chunk.choices[0].delta;
-                        if (delta && delta.content) {
-                            fullContent += delta.content;
-                            if (typeof onChunk === 'function') {
-                                onChunk(delta.content);
-                                hasStreamedChunks = true;
-                            }
-                        }
-                        if (delta && delta.status === 'finished') finished = true;
-                        if (chunk.choices[0].finish_reason) finished = true;
-                    }
-
-                    if (chunk.usage) usage = chunk.usage;
+                    appendQwenStreamChunk(accumulator, chunk, onChunk);
                 } catch {
                     // Ignore broken chunks, keep reading stream.
                 }
@@ -532,21 +526,21 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         }
 
         if (streamError) {
-            return { success: false, ...streamError, hasStreamedChunks };
+            return { success: false, ...streamError, hasStreamedChunks: accumulator.hasStreamedChunks };
         }
 
         return {
             success: true,
             isTask: false,
-            hasStreamedChunks,
+            hasStreamedChunks: accumulator.hasStreamedChunks,
             data: {
-                id: responseId || 'chatcmpl-' + Date.now(),
+                id: accumulator.responseId || 'chatcmpl-' + Date.now(),
                 object: 'chat.completion',
                 created: Math.floor(Date.now() / 1000),
                 model: payload.model,
-                choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
-                usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                response_id: responseId
+                choices: [{ index: 0, message: buildAssistantMessage(accumulator.content, accumulator.reasoningContent), finish_reason: 'stop' }],
+                usage: accumulator.usage,
+                response_id: accumulator.responseId
             }
         };
     } catch (error) {
@@ -555,7 +549,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 }
 
 async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
-    if (payload?.stream !== false && typeof onChunk === 'function') {
+    if (payload?.stream !== false) {
         const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
 
         const canReturnDirectly =
@@ -636,10 +630,17 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                 const decoder = new TextDecoder();
                 let buffer = '';
                 let fullContent = '';
+                let fullReasoningContent = '';
                 let responseId = null;
                 let usage = null;
                 let finished = false;
                 let streamError = null;
+
+                const isThinkingPhase = (phase) => {
+                    const normalized = typeof phase === 'string' ? phase.trim().toLowerCase() : '';
+                    return normalized === 'think' || normalized === 'thinking' || normalized === 'reasoning';
+                };
+                const appendValue = (value) => value === undefined || value === null ? '' : String(value);
 
                 while (!finished) {
                     const { done, value } = await reader.read();
@@ -648,9 +649,12 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
 
-                    for (const line of lines) {
-                        if (!line.trim() || !line.startsWith('data: ')) continue;
-                        const jsonStr = line.substring(6).trim();
+                    for (const rawLine of lines) {
+                        const line = rawLine.trim();
+                        if (!line) continue;
+                        const jsonStr = line.startsWith('data:')
+                            ? line.substring(5).trim()
+                            : line.startsWith('{') ? line : '';
                         if (!jsonStr) continue;
                         try {
                             const chunk = JSON.parse(jsonStr);
@@ -667,10 +671,27 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                             }
 
                             if (chunk['response.created']) responseId = chunk['response.created'].response_id;
+                            if (chunk.response_id) responseId = chunk.response_id;
                             if (chunk.choices && chunk.choices[0]) {
                                 const delta = chunk.choices[0].delta;
-                                if (delta && delta.content) fullContent += delta.content;
-                                if (delta && delta.status === 'finished') finished = true;
+                                if (delta) {
+                                    const phase = delta.phase;
+                                    const explicitReasoning =
+                                        appendValue(delta.reasoning_content) +
+                                        appendValue(delta.reasoning) +
+                                        appendValue(delta.thinking) +
+                                        appendValue(delta.thinking_content);
+                                    if (explicitReasoning) fullReasoningContent += explicitReasoning;
+                                    if (delta.content) {
+                                        if (isThinkingPhase(phase)) {
+                                            fullReasoningContent += String(delta.content);
+                                        } else {
+                                            fullContent += String(delta.content);
+                                        }
+                                    }
+                                    if (delta.status === 'finished' && !isThinkingPhase(phase)) finished = true;
+                                }
+                                if (chunk.choices[0].finish_reason) finished = true;
                             }
                             if (chunk.usage) usage = chunk.usage;
                         } catch { /* ignore parse errors for individual chunks */ }
@@ -689,7 +710,18 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                         object: 'chat.completion',
                         created: Math.floor(Date.now() / 1000),
                         model: data.payload.model,
-                        choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
+                        choices: [{
+                            index: 0,
+                            message: {
+                                role: 'assistant',
+                                content: fullContent,
+                                ...(fullReasoningContent ? {
+                                    reasoning_content: fullReasoningContent,
+                                    reasoning: fullReasoningContent
+                                } : {})
+                            },
+                            finish_reason: 'stop'
+                        }],
                         usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                         response_id: responseId
                     }
@@ -704,7 +736,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     }, requestBody);
 }
 
-async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
+async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, reasoningOptions = {}) {
     logRaw(JSON.stringify(response));
     logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
     if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
@@ -729,7 +761,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         }
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, reasoningOptions);
         }
         logError('Не осталось валидных токенов или исчерпаны попытки.');
         return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
@@ -753,7 +785,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         authToken = null;
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, reasoningOptions);
         }
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
@@ -763,7 +795,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // ─── Main public API ─────────────────────────────────────────────────────────
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, reasoningOptions = {}) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     if (!chatId) {
@@ -816,7 +848,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Отправка запроса к API v2...');
 
-        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
+        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningOptions);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
         logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
 
@@ -896,15 +928,21 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
             
-            // Fallback: если поток чанков не был отдан, отправляем контент единым куском.
-            if (typeof onChunk === 'function' && response.data.choices?.[0]?.message?.content && !response.hasStreamedChunks) {
-                onChunk(response.data.choices[0].message.content);
+            // Fallback: если поток чанков не был отдан, отправляем части единым куском.
+            if (typeof onChunk === 'function' && response.data.choices?.[0]?.message && !response.hasStreamedChunks) {
+                const message = response.data.choices[0].message;
+                if (message.reasoning_content) {
+                    onChunk(message.reasoning_content, 'reasoning');
+                }
+                if (message.content) {
+                    onChunk(message.content, 'content');
+                }
             }
             
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk, reasoningOptions);
     } catch (error) {
         logError('Ошибка при отправке сообщения', error);
         return { error: error.toString(), chatId };

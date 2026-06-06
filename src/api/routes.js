@@ -14,6 +14,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { listTokens, markInvalid, markRateLimited, markValid } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
+import { getReasoningOptionsFromRequest, getToolAwareReasoningOptionsFromRequest } from './qwenReasoning.js';
 
 // Функция для генерирования детерминированного chatId на основе истории
 function generateChatIdFromHistory(messages) {
@@ -649,6 +650,12 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
 
 // ─── Helpers: streaming ──────────────────────────────────────────────────────
 
+function buildOpenAIStreamDelta(chunk, partType = 'content') {
+    return partType === 'reasoning'
+        ? { reasoning_content: chunk }
+        : { content: chunk };
+}
+
 async function handleStreamingResponse(res, mappedModel, messageContent, chatId, parentId, combinedTools, toolChoice, systemMessage) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -726,6 +733,7 @@ function handleNonStreamingResponse(res, result, mappedModel) {
 router.post('/chat', async (req, res) => {
     try {
         const { message, messages, model, chatId, parentId, stream, chatType, size, waitForCompletion } = req.body;
+        const reasoningOptions = getReasoningOptionsFromRequest(req.body);
 
         // Поддержка как message, так и messages для совместимости
         let messageContent = message;
@@ -783,7 +791,7 @@ router.post('/chat', async (req, res) => {
                 let streamingCallback = null;
                 let hasStreamedChunks = false;
                 if (stream) {
-                    streamingCallback = (chunk) => {
+                    streamingCallback = (chunk, partType = 'content') => {
                         hasStreamedChunks = true;
                         writeSse({
                             id: 'chatcmpl-' + Date.now(),
@@ -791,7 +799,7 @@ router.post('/chat', async (req, res) => {
                             created: Math.floor(Date.now() / 1000),
                             model: mappedModel || 'qwen-max-latest',
                             choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
+                                { index: 0, delta: buildOpenAIStreamDelta(chunk, partType), finish_reason: null }
                             ]
                         });
                     };
@@ -810,7 +818,8 @@ router.post('/chat', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    reasoningOptions
                 );
 
                 if (result.error) {
@@ -875,7 +884,7 @@ router.post('/chat', async (req, res) => {
             }
         }
 
-            const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, chatType || 't2t', size || null, waitForCompletion ?? true);
+            const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, chatType || 't2t', size || null, waitForCompletion ?? true, 0, null, reasoningOptions);
 
         if (result.choices && result.choices[0] && result.choices[0].message) {
             const responseLength = result.choices[0].message.content ? result.choices[0].message.content.length : 0;
@@ -1081,6 +1090,8 @@ router.post('/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
+        const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
+        const reasoningOptions = getToolAwareReasoningOptionsFromRequest(req.body, hasTools);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
@@ -1158,7 +1169,7 @@ router.post('/chat/completions', async (req, res) => {
                 let hasStreamedChunks = false;
                 const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
-                    streamingCallback = (chunk) => {
+                    streamingCallback = (chunk, partType = 'content') => {
                         hasStreamedChunks = true;
                         writeSse({
                             id: 'chatcmpl-stream',
@@ -1166,7 +1177,7 @@ router.post('/chat/completions', async (req, res) => {
                             created: Math.floor(Date.now() / 1000),
                             model: mappedModel || 'qwen-max-latest',
                             choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
+                                { index: 0, delta: buildOpenAIStreamDelta(chunk, partType), finish_reason: null }
                             ]
                         });
                     };
@@ -1185,7 +1196,8 @@ router.post('/chat/completions', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    reasoningOptions
                 );
 
                 if (captureToolCalls) {
@@ -1268,7 +1280,7 @@ router.post('/chat/completions', async (req, res) => {
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
             // Сохраняем chatId в сессию для следующих запросов
             if (!isMeta && result.chatId) {
@@ -1406,6 +1418,8 @@ router.post('/v1/chat/completions', async (req, res) => {
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
+        const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
+        const reasoningOptions = getToolAwareReasoningOptionsFromRequest(req.body, hasTools);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
@@ -1485,7 +1499,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                 let hasStreamedChunks = false;
                 const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
                 if (stream && !captureToolCalls) {
-                    streamingCallback = (chunk) => {
+                    streamingCallback = (chunk, partType = 'content') => {
                         hasStreamedChunks = true;
                         // OpenWebUI не нуждается в role в чанках - только контент
                         writeSse({
@@ -1494,7 +1508,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                             created: Math.floor(Date.now() / 1000),
                             model: mappedModel || 'qwen-max-latest',
                             choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
+                                { index: 0, delta: buildOpenAIStreamDelta(chunk, partType), finish_reason: null }
                             ]
                         });
                     };
@@ -1513,7 +1527,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    reasoningOptions
                 );
 
                 if (captureToolCalls) {
@@ -1592,7 +1607,7 @@ router.post('/v1/chat/completions', async (req, res) => {
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
             // Сохраняем chatId в сессии для следующих запросов
             if (!isMeta && result.chatId) {
@@ -1614,8 +1629,11 @@ router.post('/v1/chat/completions', async (req, res) => {
 
             // Извлекаем контент сообщения
             let messageText = '';
+            let reasoningText = '';
             if (result.choices && result.choices[0] && result.choices[0].message) {
-                messageText = result.choices[0].message.content || '';
+                const assistantMessage = result.choices[0].message;
+                messageText = assistantMessage.content || '';
+                reasoningText = assistantMessage.reasoning_content || assistantMessage.reasoning || '';
             } else if (result.response && result.response.text) {
                 messageText = result.response.text;
             }
@@ -1634,7 +1652,11 @@ router.post('/v1/chat/completions', async (req, res) => {
                     index: 0,
                     message: {
                         role: "assistant",
-                        content: messageText
+                        content: messageText,
+                        ...(reasoningText ? {
+                            reasoning_content: reasoningText,
+                            reasoning: reasoningText
+                        } : {})
                     },
                     finish_reason: "stop"
                 }],
