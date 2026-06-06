@@ -4,8 +4,11 @@
 
 import axios from 'axios';
 import readline from 'readline';
+import { getMappedModel } from '../src/api/modelMapping.js';
+import { DEFAULT_MODEL } from '../src/config.js';
 
 const API_URL = 'http://localhost:3264/api/chat/completions';
+const CHAT_MODEL = getMappedModel('qwen-max-latest', DEFAULT_MODEL);
 
 const rl = readline.createInterface({
     input: process.stdin,
@@ -31,7 +34,7 @@ async function streamChat(userMessage) {
                         content: userMessage
                     }
                 ],
-                model: 'qwen-max-latest',
+                model: CHAT_MODEL,
                 stream: true
             },
             {

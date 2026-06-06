@@ -39,3 +39,4 @@ venv/
 *.swo 
 
 src/Authorization.txt
+tmp_response*.json
