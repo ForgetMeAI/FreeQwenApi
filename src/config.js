@@ -50,6 +50,8 @@ export const PORT = Number(process.env.PORT) || 3264;
 export const HOST = process.env.HOST || '0.0.0.0';
 export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'qwen-max-latest';
 export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(process.env.ALLOW_UNSCOPED_SESSION_CHAT_RESTORE);
+export const QWEN_THINKING_ENABLED = toBoolean(process.env.QWEN_THINKING_ENABLED ?? 'true');
+export const QWEN_THINKING_BUDGET = Number(process.env.QWEN_THINKING_BUDGET) || 81920;
 
 // ─── Логирование ─────────────────────────────────────────────────────────────
 export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';

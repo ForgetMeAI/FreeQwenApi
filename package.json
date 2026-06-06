@@ -6,7 +6,7 @@
     "type": "module",
     "scripts": {
         "start": "node index.js",
-        "test": "echo \"Ошибка: тест не задан\" && exit 1",
+        "test": "node --test \"tests/**/*.test.js\"",
         "example:stream": "node examples/openai-sdk/streaming.js",
         "example:simple": "node examples/openai-sdk/simple.js",
         "example:system": "node examples/openai-sdk/system-message.js",

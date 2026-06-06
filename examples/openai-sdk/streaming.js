@@ -4,8 +4,8 @@
 import OpenAI from 'openai';
 
 const openai = new OpenAI({
-    baseURL: 'http://localhost:3264/api', 
-    apiKey: 'dummy-key', 
+    baseURL: 'http://localhost:3264/api',
+    apiKey: 'dummy-key',
 });
 
 async function streamFromQwen() {
@@ -17,8 +17,8 @@ async function streamFromQwen() {
             messages: [
                 { role: 'user', content: 'Напиши небольшую историю о космических путешествиях' }
             ],
-            model: 'qwen-max-latest', 
-            stream: true, 
+            model: 'qwen-max-latest',
+            stream: true,
         });
 
         console.log('Ответ от Qwen (потоковый режим):\n');
@@ -36,4 +36,4 @@ async function streamFromQwen() {
 }
 
 // Запуск
-streamFromQwen(); 
+streamFromQwen();

@@ -33,6 +33,8 @@ SESSION_DIR = "session"
 TOKENS_FILE = os.path.join(SESSION_DIR, "tokens.json")
 DEFAULT_MODEL = "qwen-max-latest"
 AVAILABLE_MODELS_FILE = os.path.join("src", "AvailableModels.txt")
+QWEN_THINKING_ENABLED = os.environ.get("QWEN_THINKING_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off", "none"}
+QWEN_THINKING_BUDGET = int(os.environ.get("QWEN_THINKING_BUDGET", "81920"))
 
 # =================================================================
 # MODEL MAPPING (Embedded for standalone usage)
@@ -277,7 +279,11 @@ def build_qwen_payload(message_content, model, chat_id, parent_id=None, system_m
         "files": files or [],
         "childrenIds": [assistant_msg_id],
         "extra": {"meta": {"subChatType": "t2t"}},
-        "feature_config": {"thinking_enabled": False, "output_schema": "phase"}
+        "feature_config": {
+            "thinking_enabled": QWEN_THINKING_ENABLED,
+            "output_schema": "phase",
+            **({"thinking_budget": QWEN_THINKING_BUDGET} if QWEN_THINKING_ENABLED else {})
+        }
     }
     
     payload = {
@@ -342,7 +348,12 @@ def _extract_chat_ids(body: Dict[str, Any]):
     parent_id = body.get("parentId") or body.get("parent_id") or body.get("x_qwen_parent_id")
     return chat_id, parent_id
 
-def _build_openai_completion(content: str, model: str, chat_id: Optional[str], parent_id: Optional[str], usage: Optional[Dict[str, Any]] = None):
+def _build_openai_completion(content: str, model: str, chat_id: Optional[str], parent_id: Optional[str], usage: Optional[Dict[str, Any]] = None, reasoning_content: str = ""):
+    message = {"role": "assistant", "content": content}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+        message["reasoning"] = reasoning_content
+
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -350,7 +361,7 @@ def _build_openai_completion(content: str, model: str, chat_id: Optional[str], p
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": content},
+            "message": message,
             "finish_reason": "stop"
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -442,25 +453,33 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
                     return structured_error
 
                 content = ""
+                reasoning_content = ""
                 choices = parsed.get("choices")
                 if isinstance(choices, list) and choices:
                     first_choice = choices[0] if isinstance(choices[0], dict) else {}
                     msg = first_choice.get("message") if isinstance(first_choice.get("message"), dict) else {}
                     content = str(msg.get("content") or "")
+                    reasoning_content = str(msg.get("reasoning_content") or msg.get("reasoning") or "")
                 elif parsed.get("success") is True and isinstance(parsed.get("data"), dict):
                     content = str(parsed["data"].get("content") or "")
+                    reasoning_content = str(parsed["data"].get("reasoning_content") or parsed["data"].get("reasoning") or "")
 
-                if content and callable(on_chunk):
-                    on_chunk(content)
+                if (content or reasoning_content) and callable(on_chunk):
+                    if reasoning_content:
+                        on_chunk(reasoning_content, "reasoning")
+                    if content:
+                        on_chunk(content, "content")
 
                 return {
                     "success": True,
                     "content": content,
+                    "reasoning_content": reasoning_content,
                     "response_id": parsed.get("response_id") or parsed.get("id"),
                     "usage": parsed.get("usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 }
 
             full_content = ""
+            full_reasoning_content = ""
             response_id = None
             usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
             finished = False
@@ -502,20 +521,41 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
 
                 first_choice = choices[0] if isinstance(choices[0], dict) else {}
                 delta = first_choice.get("delta") if isinstance(first_choice.get("delta"), dict) else {}
+                phase = str(delta.get("phase") or "").strip().lower()
+                is_thinking_phase = phase in {"think", "thinking", "reasoning"}
+
+                reasoning_piece = (
+                    delta.get("reasoning_content") or
+                    delta.get("reasoning") or
+                    delta.get("thinking") or
+                    delta.get("thinking_content")
+                )
+                if reasoning_piece is not None:
+                    reasoning_piece_str = str(reasoning_piece)
+                    full_reasoning_content += reasoning_piece_str
+                    if callable(on_chunk):
+                        on_chunk(reasoning_piece_str, "reasoning")
+
                 piece = delta.get("content")
                 if piece is not None:
                     piece_str = str(piece)
-                    full_content += piece_str
-                    if callable(on_chunk):
-                        on_chunk(piece_str)
+                    if is_thinking_phase:
+                        full_reasoning_content += piece_str
+                        if callable(on_chunk):
+                            on_chunk(piece_str, "reasoning")
+                    else:
+                        full_content += piece_str
+                        if callable(on_chunk):
+                            on_chunk(piece_str, "content")
 
-                if delta.get("status") == "finished" or first_choice.get("finish_reason"):
+                if first_choice.get("finish_reason") or (delta.get("status") == "finished" and not is_thinking_phase):
                     finished = True
                     break
 
             return {
                 "success": True,
                 "content": full_content,
+                "reasoning_content": full_reasoning_content,
                 "response_id": response_id,
                 "usage": usage,
                 "finished": finished
@@ -547,9 +587,9 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
     queue: asyncio.Queue = asyncio.Queue()
     has_streamed_chunks = False
 
-    def on_chunk(chunk_text: str):
+    def on_chunk(chunk_text: str, part_type: str = "content"):
         if chunk_text:
-            queue.put_nowait(chunk_text)
+            queue.put_nowait((part_type, chunk_text))
 
     task = asyncio.create_task(execute_qwen_completion(token_info, chat_id, payload, on_chunk=on_chunk))
 
@@ -558,17 +598,18 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
             if task.done() and queue.empty():
                 break
             try:
-                chunk = await asyncio.wait_for(queue.get(), timeout=0.2)
+                part_type, chunk = await asyncio.wait_for(queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
 
             has_streamed_chunks = True
+            delta = {"reasoning_content": chunk} if part_type == "reasoning" else {"content": chunk}
             yield "data: " + json.dumps({
                 "id": "chatcmpl-stream",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
             }, ensure_ascii=False) + "\n\n"
 
         result = await task
@@ -582,15 +623,19 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
                     "model": model,
                     "choices": [{"index": 0, "delta": {"content": err_text}, "finish_reason": None}]
                 }, ensure_ascii=False) + "\n\n"
-        elif not has_streamed_chunks and result.get("content"):
+        elif not has_streamed_chunks and (result.get("reasoning_content") or result.get("content")):
             # Qwen иногда отвечает обычным JSON вместо SSE.
-            yield "data: " + json.dumps({
-                "id": "chatcmpl-stream",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": result["content"]}, "finish_reason": None}]
-            }, ensure_ascii=False) + "\n\n"
+            for part_type, chunk in (("reasoning", result.get("reasoning_content")), ("content", result.get("content"))):
+                if not chunk:
+                    continue
+                delta = {"reasoning_content": chunk} if part_type == "reasoning" else {"content": chunk}
+                yield "data: " + json.dumps({
+                    "id": "chatcmpl-stream",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                }, ensure_ascii=False) + "\n\n"
 
         yield "data: " + json.dumps({
             "id": "chatcmpl-stream",
@@ -673,6 +718,7 @@ async def handle_chat_completions(body: Dict[str, Any]):
         chat_id,
         response_parent_id,
         usage=result.get("usage"),
+        reasoning_content=result.get("reasoning_content", ""),
     )
 
 @app.get("/api/chat/completions")
