@@ -55,7 +55,7 @@ export const OSS_SDK_URL = process.env.OSS_SDK_URL || 'https://gosspublic.alicdn
 
 // ─── Таймауты (мс) ──────────────────────────────────────────────────────────
 export const PAGE_TIMEOUT = Number(process.env.PAGE_TIMEOUT) || 120_000;
-export const PROTOCOL_TIMEOUT = Number(process.env.PROTOCOL_TIMEOUT) || 300_000;
+export const PROTOCOL_TIMEOUT = Number(process.env.PROTOCOL_TIMEOUT) || 600_000;
 export const AUTH_TIMEOUT = Number(process.env.AUTH_TIMEOUT) || 120_000;
 export const NAVIGATION_TIMEOUT = Number(process.env.NAVIGATION_TIMEOUT) || 60_000;
 export const RETRY_DELAY = Number(process.env.RETRY_DELAY) || 2_000;

@@ -12,7 +12,28 @@ import {
     SESSION_DIR, ACCOUNTS_DIR
 } from '../config.js';
 
-puppeteer.use(StealthPlugin());
+// Disable the 'sourceurl' evasion which can cause protocol timeouts in Docker
+const stealthPlugin = StealthPlugin({
+    enabledEvasions: new Set([
+        'chrome.app',
+        'chrome.csi',
+        'chrome.loadTimes',
+        'chrome.runtime',
+        'defaultArgs',
+        'iframe.contentWindow',
+        'media.codecs',
+        'navigator.hardwareConcurrency',
+        'navigator.languages',
+        'navigator.permissions',
+        'navigator.plugins',
+        'navigator.webdriver',
+        // 'sourceurl',  // Disabled: causes Runtime.callFunctionOn timeout in Docker
+        'user-agent-override',
+        'webgl.vendor',
+        'window.outerdimensions'
+    ])
+});
+puppeteer.use(stealthPlugin);
 
 let browserInstance = null;
 let browserContext = null;
