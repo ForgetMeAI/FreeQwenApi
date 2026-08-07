@@ -9,7 +9,7 @@ import { addAccountInteractive } from './src/utils/accountSetup.js';
 import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.js';
 import { prompt } from './src/utils/prompt.js';
 import { FORGETMEAI_WATERMARK } from './src/utils/branding.js';
-import { PORT, HOST } from './src/config.js';
+import { PORT, HOST, NON_INTERACTIVE } from './src/config.js';
 import { isBrowserOriginAllowed, normalizeOrigin, parseAllowedOrigins } from './src/api/originPolicy.js';
 
 const app = express();
@@ -18,16 +18,11 @@ const port = Number.parseInt(process.env.PORT ?? PORT, 10);
 const host = process.env.HOST || HOST;
 const allowedBrowserOrigins = parseAllowedOrigins(process.env.CORS_ORIGINS);
 
+const skipAccountMenu = NON_INTERACTIVE;
+
 if (Number.isNaN(port) || port <= 0 || port > 65535) {
     throw new Error(`Некорректное значение переменной PORT: ${process.env.PORT}`);
 }
-
-function toBoolean(value) {
-    if (typeof value !== 'string') return false;
-    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
-}
-
-const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(process.env.NON_INTERACTIVE);
 
 function ensureNonInteractiveTokens() {
     const tokens = loadTokens();

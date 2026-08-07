@@ -6,10 +6,12 @@ import { clearPagePool, getAuthToken } from '../api/chat.js';
 import fs from 'fs';
 import path from 'path';
 import { logInfo, logError, logWarn, logDebug } from '../logger/index.js';
+import { browserLifecycleMutex } from '../utils/mutex.js';
 import {
     CHAT_PAGE_URL, NAVIGATION_TIMEOUT, RETRY_DELAY, PROTOCOL_TIMEOUT,
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, USER_AGENT,
-    SESSION_DIR, ACCOUNTS_DIR
+    SESSION_DIR, ACCOUNTS_DIR, NON_INTERACTIVE,
+    BROWSER_LAUNCH_MAX_RETRIES, SESSION_MAX_COUNT
 } from '../config.js';
 
 // Disable the 'sourceurl' evasion which can cause protocol timeouts in Docker
@@ -42,97 +44,129 @@ export let isAuthenticated = false;
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 export async function initBrowser(visibleMode = true, skipManualRestart = false) {
-    if (browserInstance) return true;
+    // Use mutex to prevent concurrent browser initialization
+    return browserLifecycleMutex.runExclusive(async () => {
+        if (browserInstance) return true;
 
-    logInfo('Инициализация браузера с Puppeteer Stealth...');
-    try {
-        browserInstance = await puppeteer.launch({
-            headless: !visibleMode,
-            slowMo: visibleMode ? 30 : 0,
-            executablePath: process.env.CHROME_PATH || undefined,
-            args: [
-                '--no-sandbox', '--disable-setuid-sandbox',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage', '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-                `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
-                '--start-maximized', '--disable-infobars',
-                '--disable-extensions', '--disable-gpu',
-                '--no-first-run', '--no-default-browser-check',
-                '--ignore-certificate-errors', '--ignore-certificate-errors-spki-list'
-            ],
-            defaultViewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
-            protocolTimeout: PROTOCOL_TIMEOUT,
-            ignoreHTTPSErrors: true
-        });
+        logInfo('Инициализация браузера с Puppeteer Stealth...');
 
-        const pages = await browserInstance.pages();
-        const page = pages.length > 0 ? pages[0] : await browserInstance.newPage();
+        // Retry logic with exponential backoff for browser launch
+        let lastError = null;
+        for (let attempt = 1; attempt <= BROWSER_LAUNCH_MAX_RETRIES; attempt++) {
+            let page = null;
+            try {
+                browserInstance = await puppeteer.launch({
+                    headless: !visibleMode,
+                    slowMo: visibleMode ? 30 : 0,
+                    executablePath: process.env.CHROME_PATH || undefined,
+                    args: [
+                        '--no-sandbox', '--disable-setuid-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--disable-features=IsolateOrigins,site-per-process',
+                        `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
+                        '--start-maximized', '--disable-infobars',
+                        '--disable-extensions', '--disable-gpu',
+                        '--no-first-run', '--no-default-browser-check'
+                    ],
+                    defaultViewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT },
+                    protocolTimeout: PROTOCOL_TIMEOUT
+                });
 
-        await page.setUserAgent(USER_AGENT);
-        await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT, deviceScaleFactor: 1 });
-        await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        });
+                const pages = await browserInstance.pages();
+                page = pages.length > 0 ? pages[0] : await browserInstance.newPage();
 
-        await page.evaluateOnNewDocument(() => {
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-            Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [{ 0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }, description: 'Portable Document Format', filename: 'internal-pdf-viewer', length: 1, name: 'Chrome PDF Plugin' }]
-            });
-            Object.defineProperty(navigator, 'connection', {
-                get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
-            });
-            if (!navigator.getBattery) {
-                navigator.getBattery = () => Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 });
-            }
+                await page.setUserAgent(USER_AGENT);
+                await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT, deviceScaleFactor: 1 });
+                await page.setExtraHTTPHeaders({
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                });
 
-            const originalAddEventListener = EventTarget.prototype.addEventListener;
-            EventTarget.prototype.addEventListener = function (type, listener, options) {
-                if (type === 'mousemove' || type === 'mousedown' || type === 'mouseup') {
-                    const wrappedListener = function (event) { setTimeout(() => listener.call(this, event), Math.random() * 3); };
-                    return originalAddEventListener.call(this, type, wrappedListener, options);
-                }
-                return originalAddEventListener.call(this, type, listener, options);
-            };
-
-            const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-            HTMLCanvasElement.prototype.toDataURL = function (type) {
-                const context = this.getContext('2d');
-                if (context) {
-                    const imageData = context.getImageData(0, 0, this.width, this.height);
-                    const data = imageData.data;
-                    for (let i = 0; i < data.length; i += 4) {
-                        const noise = Math.floor(Math.random() * 5) - 2;
-                        data[i] = Math.max(0, Math.min(255, data[i] + noise));
-                        data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise));
-                        data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise));
+                await page.evaluateOnNewDocument(() => {
+                    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+                    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [{ 0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }, description: 'Portable Document Format', filename: 'internal-pdf-viewer', length: 1, name: 'Chrome PDF Plugin' }]
+                    });
+                    Object.defineProperty(navigator, 'connection', {
+                        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
+                    });
+                    if (!navigator.getBattery) {
+                        navigator.getBattery = () => Promise.resolve({ charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1 });
                     }
-                    context.putImageData(imageData, 0, 0);
+
+                    const originalAddEventListener = EventTarget.prototype.addEventListener;
+                    EventTarget.prototype.addEventListener = function (type, listener, options) {
+                        if (type === 'mousemove' || type === 'mousedown' || type === 'mouseup') {
+                            const wrappedListener = function (event) { setTimeout(() => listener.call(this, event), Math.random() * 3); };
+                            return originalAddEventListener.call(this, type, wrappedListener, options);
+                        }
+                        return originalAddEventListener.call(this, type, listener, options);
+                    };
+
+                    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function (type) {
+                        const context = this.getContext('2d');
+                        if (context) {
+                            const imageData = context.getImageData(0, 0, this.width, this.height);
+                            const data = imageData.data;
+                            for (let i = 0; i < data.length; i += 4) {
+                                const noise = Math.floor(Math.random() * 5) - 2;
+                                data[i] = Math.max(0, Math.min(255, data[i] + noise));
+                                data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + noise));
+                                data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + noise));
+                            }
+                            context.putImageData(imageData, 0, 0);
+                        }
+                        return originalToDataURL.apply(this, arguments);
+                    };
+                });
+
+                browserContext = page;
+                page = null; // Page is now managed by browserContext, don't close on error
+                logInfo('Браузер инициализирован с максимальной защитой от обнаружения');
+
+                if (visibleMode) {
+                    await startManualAuthenticationPuppeteer(browserContext, skipManualRestart);
                 }
-                return originalToDataURL.apply(this, arguments);
-            };
-        });
+                // loadSessionPuppeteer removed — was dead code (always returned false)
 
-        browserContext = page;
-        logInfo('Браузер инициализирован с максимальной защитой от обнаружения');
+                // Clean up old sessions after successful initialization
+                await cleanupOldSessions();
 
-        if (visibleMode) {
-            await startManualAuthenticationPuppeteer(page, skipManualRestart);
+                return true;
+            } catch (error) {
+                lastError = error;
+                logWarn(`Попытка ${attempt}/${BROWSER_LAUNCH_MAX_RETRIES} инициализации браузера не удалась: ${error.message}`);
+                
+                // Clean up page if it was created but not assigned to browserContext
+                if (page) {
+                    try { await page.close(); } catch { /* ignore */ }
+                }
+                // Clean up browser instance if it was created
+                if (browserInstance) {
+                    try { await browserInstance.close(); } catch { /* ignore */ }
+                    browserInstance = null;
+                }
+                browserContext = null;
+
+                // If not the last attempt, wait before retry with exponential backoff
+                if (attempt < BROWSER_LAUNCH_MAX_RETRIES) {
+                    const backoffDelay = RETRY_DELAY * Math.pow(2, attempt - 1); // 2s, 4s, 8s...
+                    logInfo(`Ожидание ${backoffDelay}мс перед повторной попыткой...`);
+                    await delay(backoffDelay);
+                }
+            }
         }
-        // loadSessionPuppeteer removed — was dead code (always returned false)
 
-        return true;
-    } catch (error) {
-        logError('Ошибка при инициализации браузера', error);
+        logError(`Все ${BROWSER_LAUNCH_MAX_RETRIES} попытки инициализации браузера исчерпаны`, lastError);
         return false;
-    }
+    });
 }
 
 async function saveSessionPuppeteer(page) {
@@ -154,7 +188,46 @@ async function saveSessionPuppeteer(page) {
     }
 }
 
+// Clean up old session folders to prevent unbounded disk usage
+async function cleanupOldSessions() {
+    try {
+        const sessionDir = path.join(process.cwd(), SESSION_DIR, ACCOUNTS_DIR);
+        if (!fs.existsSync(sessionDir)) return;
+
+        const entries = await fs.promises.readdir(sessionDir, { withFileTypes: true });
+        const accountDirs = entries
+            .filter(entry => entry.isDirectory() && entry.name.startsWith('acc_'))
+            .map(entry => ({
+                name: entry.name,
+                path: path.join(sessionDir, entry.name),
+                time: parseInt(entry.name.replace('acc_', ''), 10) || 0
+            }))
+            .sort((a, b) => b.time - a.time); // Newest first
+
+        if (accountDirs.length > SESSION_MAX_COUNT) {
+            const toDelete = accountDirs.slice(SESSION_MAX_COUNT);
+            for (const dir of toDelete) {
+                try {
+                    await fs.promises.rm(dir.path, { recursive: true, force: true });
+                    logInfo(`Удалена старая сессия: ${dir.name}`);
+                } catch (e) {
+                    logWarn(`Не удалось удалить сессию ${dir.name}: ${e.message}`);
+                }
+            }
+        }
+    } catch (error) {
+        logError('Ошибка при очистке старых сессий', error);
+    }
+}
+
 async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
+    // In non-interactive mode (Docker, CI, etc.), fail fast with clear error
+    if (NON_INTERACTIVE || !process.stdin.isTTY) {
+        logWarn('Non-interactive mode: skipping manual authentication. Browser will run without auth.');
+        logWarn('Set NON_INTERACTIVE=0 and provide a TTY for interactive auth, or pre-authenticate accounts.');
+        return false;
+    }
+
     try {
         logInfo('Открытие страницы для ручной авторизации...');
         await page.goto(CHAT_PAGE_URL, { waitUntil: 'networkidle2', timeout: NAVIGATION_TIMEOUT });
@@ -241,6 +314,7 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
         logInfo('Авторизация завершена успешно');
 
         if (!skipManualRestart) await restartBrowserInHeadlessMode();
+        return true;
     } catch (error) {
         logError('Ошибка при ручной авторизации', error);
         throw error;
@@ -248,33 +322,88 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
 }
 
 export async function restartBrowserInHeadlessMode() {
-    logInfo('Перезапуск браузера в фоновом режиме...');
-    const token = getAuthToken();
-    if (token) { logDebug('Сохранение токена...'); saveAuthToken(token); await delay(1000); }
-    await shutdownBrowser();
-    await delay(RETRY_DELAY);
-    const success = await initBrowser(false);
-    logInfo(success ? 'Браузер перезапущен в фоновом режиме' : 'Ошибка при перезапуске браузера');
+    return browserLifecycleMutex.runExclusive(async () => {
+        logInfo('Перезапуск браузера в фоновом режиме...');
+        const token = getAuthToken();
+        if (token) { logDebug('Сохранение токена...'); saveAuthToken(token); await delay(1000); }
+        await shutdownBrowser();
+        await delay(RETRY_DELAY);
+        const success = await initBrowser(false);
+        logInfo(success ? 'Браузер перезапущен в фоновом режиме' : 'Ошибка при перезапуске браузера');
+        return success;
+    });
 }
 
 export async function shutdownBrowser() {
-    try {
-        try { await clearPagePool(); } catch (e) { logError('Ошибка при очистке пула страниц', e); }
-        if (browserInstance) {
-            try {
-                const pages = await browserInstance.pages();
-                for (const page of pages) await page.close().catch(() => {});
-                await browserInstance.close();
-            } catch (e) { logError('Ошибка при закрытии браузера', e); }
+    return browserLifecycleMutex.runExclusive(async () => {
+        try {
+            try { await clearPagePool(); } catch (e) { logError('Ошибка при очистке пула страниц', e); }
+            if (browserInstance) {
+                try {
+                    const pages = await browserInstance.pages();
+                    for (const page of pages) {
+                        try {
+                            await page.close();
+                        } catch (pageError) {
+                            logError('Ошибка при закрытии страницы', pageError);
+                        }
+                    }
+                    // Try graceful close with timeout
+                    const closePromise = browserInstance.close();
+                    const timeoutPromise = new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Browser close timeout')), 10000)
+                    );
+                    await Promise.race([closePromise, timeoutPromise]);
+                } catch (e) {
+                    logError('Ошибка при закрытии браузера, попытка принудительного завершения', e);
+                    // Force kill the browser process if graceful close failed
+                    try {
+                        if (browserInstance.process && typeof browserInstance.process === 'function') {
+                            const proc = browserInstance.process();
+                            if (proc && typeof proc.kill === 'function') {
+                                proc.kill('SIGKILL');
+                                logWarn('Browser process forcefully terminated (SIGKILL)');
+                            }
+                        }
+                    } catch (killError) {
+                        logError('Не удалось принудительно завершить процесс браузера', killError);
+                    }
+                }
+            }
+            browserContext = null;
+            browserInstance = null;
+            logInfo('Браузер закрыт');
+        } catch (error) {
+            logError('Ошибка при завершении работы браузера', error);
         }
-        browserContext = null;
-        browserInstance = null;
-        logInfo('Браузер закрыт');
-    } catch (error) {
-        logError('Ошибка при завершении работы браузера', error);
-    }
+    });
 }
 
 export function getBrowserContext() { return browserContext; }
 export function setAuthenticationStatus(status) { isAuthenticated = status; }
 export function getAuthenticationStatus() { return isAuthenticated; }
+
+// Health check: verify browser process is still responsive
+export async function checkBrowserHealth() {
+    if (!browserInstance) return false;
+    try {
+        // Quick check - if this succeeds, browser is alive
+        await browserInstance.version();
+        return true;
+    } catch (error) {
+        logWarn('Browser health check failed', error);
+        return false;
+    }
+}
+
+// Ensure browser is healthy, reinitialize if needed
+export async function ensureBrowserHealthy(visibleMode = false) {
+    const healthy = await checkBrowserHealth();
+    if (!healthy) {
+        logWarn('Browser unhealthy, reinitializing...');
+        await shutdownBrowser();
+        await delay(RETRY_DELAY);
+        return await initBrowser(visibleMode);
+    }
+    return true;
+}

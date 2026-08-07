@@ -1,4 +1,4 @@
-import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus } from '../browser/browser.js';
+import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, checkBrowserHealth, ensureBrowserHealthy } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
@@ -200,6 +200,12 @@ export const pagePool = {
     maxSize: PAGE_POOL_SIZE,
 
     async getPage(context) {
+        // Ensure browser is healthy before acquiring a page
+        const healthy = await ensureBrowserHealthy();
+        if (!healthy) {
+            throw new Error('Failed to ensure healthy browser instance');
+        }
+
         const baseContext = getBrowserContext();
         while (this.pages.length > 0) {
             const page = this.pages.pop();
