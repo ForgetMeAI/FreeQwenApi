@@ -24,19 +24,34 @@ if (Number.isNaN(port) || port <= 0 || port > 65535) {
     throw new Error(`Некорректное значение переменной PORT: ${process.env.PORT}`);
 }
 
-function ensureNonInteractiveTokens() {
-    const tokens = loadTokens();
-    if (!tokens.length) {
-        logError('Не найдено ни одного аккаунта. Запустите скрипт авторизации перед запуском сервера.');
-        process.exit(1);
+async function ensureNonInteractiveTokens() {
+    const pollInterval = 5000; // 5 seconds
+    let loggedWaiting = false;
+
+    while (true) {
+        const tokens = loadTokens();
+        if (!tokens.length) {
+            if (!loggedWaiting) {
+                logWarn('Аккаунты не найдены. Ожидание добавления аккаунтов... (поместите токены в session/accounts/)');
+                loggedWaiting = true;
+            }
+        } else {
+            const now = Date.now();
+            const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+            if (validTokens.length) {
+                if (loggedWaiting) {
+                    logInfo('Обнаружены валидные аккаунты, продолжаем запуск...');
+                }
+                logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
+                return;
+            }
+            if (!loggedWaiting) {
+                logWarn(`Найдено ${tokens.length} аккаунтов, но ни один не активен. Ожидание...`);
+                loggedWaiting = true;
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
-    const now = Date.now();
-    const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
-    if (!validTokens.length) {
-        logError('Все аккаунты недоступны. Перезапустите авторизацию перед запуском сервера.');
-        process.exit(1);
-    }
-    logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
 }
 
 app.use((req, res, next) => {
@@ -159,7 +174,7 @@ async function startServer() {
             }
         }
     } else {
-        ensureNonInteractiveTokens();
+        await ensureNonInteractiveTokens();
     }
 
     const browserInitialized = await initBrowser(false);
