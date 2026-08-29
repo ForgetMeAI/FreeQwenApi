@@ -1,4 +1,4 @@
-import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus } from '../browser/browser.js';
+import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, checkBrowserHealth, ensureBrowserHealthy } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
@@ -200,6 +200,12 @@ export const pagePool = {
     maxSize: PAGE_POOL_SIZE,
 
     async getPage(context) {
+        // Ensure browser is healthy before acquiring a page
+        const healthy = await ensureBrowserHealthy();
+        if (!healthy) {
+            throw new Error('Failed to ensure healthy browser instance');
+        }
+
         const baseContext = getBrowserContext();
         while (this.pages.length > 0) {
             const page = this.pages.pop();
@@ -822,6 +828,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                 try {
                     const chunk = JSON.parse(jsonStr);
 
+                    if (process.env.DEBUG_SSE_CHUNKS === 'true') {
+                        logWarn(`[SSE-DEBUG] ${jsonStr.substring(0, 800)}`);
+                    }
+
                     if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
                         streamError = { status: 429, errorBody: JSON.stringify(chunk) };
                         finished = true;
@@ -1084,7 +1094,7 @@ async function handleApiError(response, tokenObj, requestContext) {
     const { chatId, retryCount, fileAccountId } = requestContext;
     logRaw(JSON.stringify(response));
     logError(`Ошибка при получении ответа: ${response.error || response.statusText || `HTTP ${response.status || 'unknown'}`}`);
-    if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
+    if (response.errorBody) logWarn(`Тело ответа с ошибкой: ${response.errorBody}`);
 
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
@@ -1131,8 +1141,10 @@ async function handleApiError(response, tokenObj, requestContext) {
         let hours = 24;
         try {
             const rateInfo = JSON.parse(response.errorBody);
-            const parsedHours = Number(rateInfo.num);
-            hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+            // Qwen returns the wait time nested at data.num, in MINUTES
+            // (see data.template: "Please wait {{num}} minutes before trying again.")
+            const parsedMinutes = Number(rateInfo?.data?.num);
+            hours = Number.isFinite(parsedMinutes) && parsedMinutes > 0 ? parsedMinutes / 60 : 24;
         } catch { /* errorBody might not be valid JSON */ }
 
         markRateLimitedByToken(tokenObj?.token, hours);
@@ -1166,7 +1178,8 @@ async function handleApiError(response, tokenObj, requestContext) {
         return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
     }
 
-    return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
+    const fallbackError = response.error || response.statusText || (response.status ? `HTTP ${response.status}` : 'Неизвестная ошибка ответа');
+    return { error: fallbackError, details: response.errorBody || 'Нет дополнительных деталей', chatId };
 }
 
 // ─── Main public API ─────────────────────────────────────────────────────────
@@ -1583,8 +1596,10 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         if (isRateLimited) {
             let hours = 24;
             try {
-                const parsedHours = Number(JSON.parse(structuredErrorBody).num);
-                hours = Number.isFinite(parsedHours) && parsedHours > 0 ? parsedHours : 24;
+                // Qwen returns the wait time nested at data.num, in MINUTES
+                // (see data.template: "Please wait {{num}} minutes before trying again.")
+                const parsedMinutes = Number(JSON.parse(structuredErrorBody)?.data?.num);
+                hours = Number.isFinite(parsedMinutes) && parsedMinutes > 0 ? parsedMinutes / 60 : 24;
             } catch { /* non-JSON body */ }
             markRateLimitedByToken(tokenObj.token, hours);
             if (isBrowserAccountId(tokenObj.id) || browserAuthToken === tokenObj.token) {

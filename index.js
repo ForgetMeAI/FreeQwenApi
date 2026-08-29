@@ -9,7 +9,7 @@ import { addAccountInteractive } from './src/utils/accountSetup.js';
 import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.js';
 import { prompt } from './src/utils/prompt.js';
 import { FORGETMEAI_WATERMARK } from './src/utils/branding.js';
-import { PORT, HOST } from './src/config.js';
+import { PORT, HOST, NON_INTERACTIVE } from './src/config.js';
 import { isBrowserOriginAllowed, normalizeOrigin, parseAllowedOrigins } from './src/api/originPolicy.js';
 
 const app = express();
@@ -18,30 +18,40 @@ const port = Number.parseInt(process.env.PORT ?? PORT, 10);
 const host = process.env.HOST || HOST;
 const allowedBrowserOrigins = parseAllowedOrigins(process.env.CORS_ORIGINS);
 
+const skipAccountMenu = NON_INTERACTIVE;
+
 if (Number.isNaN(port) || port <= 0 || port > 65535) {
     throw new Error(`Некорректное значение переменной PORT: ${process.env.PORT}`);
 }
 
-function toBoolean(value) {
-    if (typeof value !== 'string') return false;
-    return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
-}
+async function ensureNonInteractiveTokens() {
+    const pollInterval = 5000; // 5 seconds
+    let loggedWaiting = false;
 
-const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(process.env.NON_INTERACTIVE);
-
-function ensureNonInteractiveTokens() {
-    const tokens = loadTokens();
-    if (!tokens.length) {
-        logError('Не найдено ни одного аккаунта. Запустите скрипт авторизации перед запуском сервера.');
-        process.exit(1);
+    while (true) {
+        const tokens = loadTokens();
+        if (!tokens.length) {
+            if (!loggedWaiting) {
+                logWarn('Аккаунты не найдены. Ожидание добавления аккаунтов... (поместите токены в session/accounts/)');
+                loggedWaiting = true;
+            }
+        } else {
+            const now = Date.now();
+            const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+            if (validTokens.length) {
+                if (loggedWaiting) {
+                    logInfo('Обнаружены валидные аккаунты, продолжаем запуск...');
+                }
+                logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
+                return;
+            }
+            if (!loggedWaiting) {
+                logWarn(`Найдено ${tokens.length} аккаунтов, но ни один не активен. Ожидание...`);
+                loggedWaiting = true;
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
-    const now = Date.now();
-    const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
-    if (!validTokens.length) {
-        logError('Все аккаунты недоступны. Перезапустите авторизацию перед запуском сервера.');
-        process.exit(1);
-    }
-    logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
 }
 
 app.use((req, res, next) => {
@@ -164,7 +174,7 @@ async function startServer() {
             }
         }
     } else {
-        ensureNonInteractiveTokens();
+        await ensureNonInteractiveTokens();
     }
 
     const browserInitialized = await initBrowser(false);

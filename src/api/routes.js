@@ -1,7 +1,7 @@
 import express from 'express';
 import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, preflightFileRequest, testToken } from './chat.js';
 import { sendApiResultError } from './apiErrors.js';
-import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
+import { getAuthenticationStatus, getBrowserContext, restartBrowserInHeadlessMode } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug } from '../logger/index.js';
 import { getMappedModel } from './modelMapping.js';
@@ -1066,6 +1066,24 @@ router.post('/chat', async (req, res) => {
             return res.status(400).json({ error: 'Сообщение не указано' });
         }
 
+        // Handle /new command - restart browser session
+        const normalizedMessage = typeof messageContent === 'string' ? messageContent.trim() : '';
+        if (normalizedMessage === '/new') {
+            logInfo('Получена команда /new - перезапуск сессии браузера');
+            try {
+                await restartBrowserInHeadlessMode();
+                return res.json({
+                    success: true,
+                    message: 'Browser session restarted',
+                    chatId: null,
+                    parentId: null
+                });
+            } catch (error) {
+                logError('Ошибка при перезапуске браузера', error);
+                return res.status(500).json({ error: 'Failed to restart browser session' });
+            }
+        }
+
         const filePreflight = preflightFileRequest(messageContent, null, getSessionKey(req));
         if (filePreflight.error) return sendApiResultError(res, filePreflight);
 
@@ -1395,6 +1413,32 @@ router.post('/chat/completions', async (req, res) => {
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
             logError('Запрос без сообщений');
             return res.status(400).json({ error: 'Сообщения не указаны' });
+        }
+
+        // Handle /new command - restart browser session
+        const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
+        const lastMessageContent = lastUserMessage?.content;
+        const normalizedLastMessage = typeof lastMessageContent === 'string' ? lastMessageContent.trim() : '';
+        if (normalizedLastMessage === '/new') {
+            logInfo('Получена команда /new - перезапуск сессии браузера');
+            try {
+                await restartBrowserInHeadlessMode();
+                return res.json({
+                    id: 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion',
+                    created: Math.floor(Date.now() / 1000),
+                    model: model || DEFAULT_MODEL,
+                    choices: [{
+                        index: 0,
+                        message: { role: 'assistant', content: 'Browser session restarted successfully.' },
+                        finish_reason: 'stop'
+                    }],
+                    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                });
+            } catch (error) {
+                logError('Ошибка при перезапуске браузера', error);
+                return res.status(500).json({ error: 'Failed to restart browser session' });
+            }
         }
 
         const isMeta = isOpenWebUiMetaRequest(messages);
